@@ -458,6 +458,10 @@ Semantic Search:
         analyze_architecture,
         analyze_dead_code,
         analyze_impact,
+        # Low-level functions that take a graph (for cached usage)
+        impact_analysis,
+        dead_code_analysis,
+        architecture_analysis,
     )
     from .dirty_flag import is_dirty, get_dirty_files, clear_dirty
     from .patch import patch_call_graph
@@ -751,27 +755,39 @@ Semantic Search:
             # Support both positional path and --project flag
             project_root = args.path if args.path else args.project_path
             lang = resolve_language(args.lang, project_root)
-            result = analyze_impact(
-                project_root,
+            # Use cached graph for performance
+            graph = _get_or_build_graph(project_root, lang, build_project_call_graph)
+            result = impact_analysis(
+                graph,
                 args.func,
                 max_depth=args.depth,
                 target_file=args.file,
-                language=lang,
             )
             print(json.dumps(result, indent=2))
 
         elif args.command == "dead":
             lang = resolve_language(args.lang, args.path)
-            result = analyze_dead_code(
-                args.path,
+            # Use cached graph for performance
+            graph = _get_or_build_graph(args.path, lang, build_project_call_graph)
+            # Get structure for function list (this is fast, no caching needed)
+            structure = get_code_structure(args.path, language=lang, max_results=1000)
+            all_functions = []
+            for file_info in structure.get("files", []):
+                file_path = file_info.get("path", "")
+                for func_name in file_info.get("functions", []):
+                    all_functions.append({"file": file_path, "name": func_name})
+            result = dead_code_analysis(
+                graph,
+                all_functions,
                 entry_points=args.entry if args.entry else None,
-                language=lang,
             )
             print(json.dumps(result, indent=2))
 
         elif args.command == "arch":
             lang = resolve_language(args.lang, args.path)
-            result = analyze_architecture(args.path, language=lang)
+            # Use cached graph for performance
+            graph = _get_or_build_graph(args.path, lang, build_project_call_graph)
+            result = architecture_analysis(graph)
             print(json.dumps(result, indent=2))
 
         elif args.command == "imports":
