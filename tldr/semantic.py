@@ -888,7 +888,7 @@ def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -
         '.go': 'go',
         '.rs': 'rust',
         '.c': 'c',
-        '.h': 'c',
+        '.h': 'cpp',  # .h files often contain C++ - parse as C++ for richer extraction
         '.cpp': 'cpp',
         '.hpp': 'cpp',
         '.cc': 'cpp',

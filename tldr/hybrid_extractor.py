@@ -174,8 +174,8 @@ class HybridExtractor:
     GO_EXTENSIONS = {".go"}
     RUST_EXTENSIONS = {".rs"}
     JAVA_EXTENSIONS = {".java"}
-    C_EXTENSIONS = {".c", ".h"}
-    CPP_EXTENSIONS = {".cpp", ".hpp", ".cc", ".cxx", ".hh"}
+    C_EXTENSIONS = {".c"}
+    CPP_EXTENSIONS = {".cpp", ".hpp", ".cc", ".cxx", ".hh", ".h"}
     RUBY_EXTENSIONS = {".rb"}
     KOTLIN_EXTENSIONS = {".kt", ".kts"}
     SWIFT_EXTENSIONS = {".swift"}
@@ -1703,8 +1703,19 @@ class HybridExtractor:
                             if dc.type == "identifier":
                                 names.add(self._safe_decode(source[dc.start_byte:dc.end_byte]))
                                 break
-            # Recurse into translation_unit
-            if child.type == "translation_unit":
+                            elif dc.type == "qualified_identifier":
+                                # Handle Class::Method patterns (common in UE5/C++)
+                                qname = self._safe_decode(source[dc.start_byte:dc.end_byte])
+                                names.add(qname)
+                                # Also add the bare method name for cross-file matching
+                                parts = qname.rsplit("::", 1)
+                                if len(parts) == 2:
+                                    names.add(parts[1])
+                                break
+            # Recurse into container nodes
+            if child.type in ("translation_unit", "namespace_definition",
+                              "class_specifier", "struct_specifier",
+                              "declaration_list"):
                 names.update(self._collect_cpp_definitions(child, source))
         return names
 
@@ -1728,7 +1739,7 @@ class HybridExtractor:
             if node_type == "preproc_include":
                 self._extract_cpp_include(child, source, module_info)
 
-            # Function definitions
+            # Function definitions (implementations with bodies)
             elif node_type == "function_definition":
                 func = self._extract_cpp_function(child, source)
                 if func:
@@ -1736,11 +1747,54 @@ class HybridExtractor:
                     # Extract call graph from function body
                     self._extract_cpp_calls(child, func.name, source, module_info.call_graph, defined_names)
 
-            # Recurse into container nodes (FIXED: was only translation_unit, missed namespaces/classes)
+            # Function/method declarations (headers without body, e.g. void Foo();)
+            elif node_type == "declaration":
+                self._extract_cpp_declaration(child, source, module_info)
+
+            # Recurse into container nodes
+            # function_definition: UE5 macros (UCLASS, etc.) cause tree-sitter to parse
+            #   entire class bodies as function_definitions - must recurse into them
+            # compound_statement: handles the body of these mangled class definitions
+            # labeled_statement: handles public:/protected:/private: sections in class bodies
+            # expression_statement: handles UFUNCTION/UPROPERTY macros parsed as expressions
             if node_type in ("translation_unit", "namespace_definition",
                              "class_specifier", "struct_specifier",
-                             "declaration", "declaration_list"):
+                             "declaration_list", "compound_statement",
+                             "labeled_statement", "function_definition",
+                             "expression_statement"):
                 self._extract_cpp_nodes(child, source, module_info, defined_names)
+
+    def _extract_cpp_declaration(self, node, source: bytes, module_info: ModuleInfo):
+        """Extract method declarations from headers (no body, just signature).
+
+        In UE5 headers, class method declarations look like:
+            void SetMovementSpeed(float Speed);
+            virtual void BeginPlay() override;
+        Tree-sitter parses these as declaration nodes containing function_declarator.
+        """
+        has_func_declarator = False
+        name = ""
+        params = []
+        return_type = None
+        is_method = False
+
+        for child in node.children:
+            if child.type in ("primitive_type", "type_identifier", "sized_type_specifier"):
+                return_type = self._safe_decode(source[child.start_byte:child.end_byte])
+            elif child.type == "function_declarator":
+                has_func_declarator = True
+                name, params, is_method = self._extract_cpp_declarator_name(child, source)
+
+        if has_func_declarator and name:
+            func = FunctionInfo(
+                name=name,
+                params=params,
+                return_type=return_type,
+                docstring=None,
+                is_method=True,  # declarations in class bodies are methods
+                line_number=node.start_point[0] + 1,
+            )
+            module_info.functions.append(func)
 
     def _extract_cpp_include(self, node, source: bytes, module_info: ModuleInfo):
         """Extract C++ #include directive."""
@@ -1768,32 +1822,44 @@ class HybridExtractor:
                 return
 
     def _extract_cpp_function(self, node, source: bytes) -> FunctionInfo | None:
-        """Extract C++ function definition."""
+        """Extract C++ function definition.
+
+        Handles both free functions and qualified methods (Class::Method).
+        UE5 code uses qualified names extensively (e.g., AMyClass::BeginPlay).
+        """
         name = ""
         params = []
         return_type = None
+        is_method = False
 
         for child in node.children:
             # Return type comes before the declarator
-            if child.type in ("primitive_type", "type_identifier", "sized_type_specifier"):
-                return_type = self._safe_decode(source[child.start_byte:child.end_byte])
+            if child.type in ("primitive_type", "type_identifier", "sized_type_specifier",
+                              "qualified_identifier"):
+                # qualified_identifier as return type (e.g., FMyStruct::FNestedType)
+                # But only treat as return type if we haven't found the function declarator yet
+                if not name and child.type == "qualified_identifier":
+                    # Check if this is actually the function declarator's qualified name
+                    # by looking ahead - if next sibling is parameter_list, this IS the name
+                    pass  # Let it fall through to function_declarator handling
+                else:
+                    return_type = self._safe_decode(source[child.start_byte:child.end_byte])
             elif child.type == "pointer_declarator":
                 # Pointer return type like int* or char*
                 for pc in child.children:
                     if pc.type == "function_declarator":
-                        for dc in pc.children:
-                            if dc.type == "identifier":
-                                name = self._safe_decode(source[dc.start_byte:dc.end_byte])
-                            elif dc.type == "parameter_list":
-                                params = self._extract_cpp_params(dc, source)
+                        name, params, is_method = self._extract_cpp_declarator_name(pc, source)
                 if return_type:
                     return_type = return_type + "*"
             elif child.type == "function_declarator":
-                for dc in child.children:
-                    if dc.type == "identifier":
-                        name = self._safe_decode(source[dc.start_byte:dc.end_byte])
-                    elif dc.type == "parameter_list":
-                        params = self._extract_cpp_params(dc, source)
+                name, params, is_method = self._extract_cpp_declarator_name(child, source)
+            elif child.type == "reference_declarator":
+                # Reference return type like const Type&
+                for rc in child.children:
+                    if rc.type == "function_declarator":
+                        name, params, is_method = self._extract_cpp_declarator_name(rc, source)
+                if return_type:
+                    return_type = return_type + "&"
 
         if not name:
             return None
@@ -1803,9 +1869,38 @@ class HybridExtractor:
             params=params,
             return_type=return_type,
             docstring=None,
-            is_method=False,
+            is_method=is_method,
             line_number=node.start_point[0] + 1,
         )
+
+    def _extract_cpp_declarator_name(self, declarator_node, source: bytes) -> tuple[str, list[str], bool]:
+        """Extract name and params from a function_declarator node.
+
+        Returns (name, params, is_method).
+        Handles both plain identifiers and qualified_identifiers (Class::Method).
+        """
+        name = ""
+        params = []
+        is_method = False
+
+        for dc in declarator_node.children:
+            if dc.type == "identifier":
+                name = self._safe_decode(source[dc.start_byte:dc.end_byte])
+            elif dc.type == "qualified_identifier":
+                # Class::Method or Namespace::Class::Method
+                name = self._safe_decode(source[dc.start_byte:dc.end_byte])
+                is_method = True
+            elif dc.type == "destructor_name":
+                # ~ClassName()
+                name = self._safe_decode(source[dc.start_byte:dc.end_byte])
+                is_method = True
+            elif dc.type == "template_function":
+                # Template specialization
+                name = self._safe_decode(source[dc.start_byte:dc.end_byte])
+            elif dc.type == "parameter_list":
+                params = self._extract_cpp_params(dc, source)
+
+        return name, params, is_method
 
     def _extract_cpp_params(self, node, source: bytes) -> list[str]:
         """Extract C++ function parameters."""
@@ -1827,10 +1922,24 @@ class HybridExtractor:
             self._extract_cpp_calls(child, caller_name, source, call_graph, defined_names)
 
     def _get_cpp_call_name(self, node, source: bytes) -> str | None:
-        """Get the name of a called function from a call_expression node."""
+        """Get the name of a called function from a call_expression node.
+
+        Handles:
+        - Simple calls: DoSomething()
+        - Qualified calls: Super::BeginPlay(), UKismetSystemLibrary::PrintString()
+        - Field/member calls: Obj->Method(), Obj.Method()
+        """
         for child in node.children:
             if child.type == "identifier":
                 return self._safe_decode(source[child.start_byte:child.end_byte])
+            elif child.type == "qualified_identifier":
+                # Return the full qualified name (e.g., Super::BeginPlay)
+                return self._safe_decode(source[child.start_byte:child.end_byte])
+            elif child.type == "field_expression":
+                # member->Method() or object.Method() — extract the method name
+                for fc in child.children:
+                    if fc.type == "field_identifier":
+                        return self._safe_decode(source[fc.start_byte:fc.end_byte])
         return None
 
     # === Ruby Extraction ===
@@ -3180,7 +3289,7 @@ class HybridExtractor:
             ".ts": "typescript", ".tsx": "typescript",
             ".go": "go", ".rs": "rust", ".rb": "ruby",
             ".java": "java", ".kt": "kotlin", ".kts": "kotlin",
-            ".c": "c", ".h": "c",
+            ".c": "c", ".h": "cpp",
             ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hh": "cpp",
             ".cs": "csharp", ".swift": "swift",
             ".scala": "scala", ".sc": "scala",

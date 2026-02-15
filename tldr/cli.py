@@ -52,7 +52,7 @@ EXTENSION_TO_LANGUAGE = {
     '.go': 'go',
     '.rs': 'rust',
     '.c': 'c',
-    '.h': 'c',
+    '.h': 'cpp',  # .h files often contain C++ (UE5, etc.) - parse as C++ for richer extraction
     '.cpp': 'cpp',
     '.hpp': 'cpp',
     '.cc': 'cpp',

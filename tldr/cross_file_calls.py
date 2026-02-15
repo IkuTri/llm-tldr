@@ -314,9 +314,9 @@ def scan_project(
     elif language == "java":
         extensions = {'.java'}
     elif language == "c":
-        extensions = {'.c', '.h'}
+        extensions = {'.c'}
     elif language == "cpp":
-        extensions = {'.cpp', '.cc', '.cxx', '.hpp', '.hh', '.hxx'}
+        extensions = {'.cpp', '.cc', '.cxx', '.hpp', '.hh', '.hxx', '.h'}
     elif language == "ruby":
         extensions = {'.rb'}
     elif language == "php":
@@ -1931,6 +1931,8 @@ def build_function_index(
             _index_java_file(src_path, rel_path, module_name, simple_module, index)
         elif language == "c":
             _index_c_file(src_path, rel_path, module_name, simple_module, index)
+        elif language == "cpp":
+            _index_cpp_file(src_path, rel_path, module_name, simple_module, index)
         elif language == "php":
             _index_php_file(src_path, rel_path, module_name, simple_module, index)
 
@@ -2300,6 +2302,199 @@ def _get_c_node_name(node, source: bytes) -> str | None:
                     for dc in pc.children:
                         if dc.type == "identifier":
                             return source[dc.start_byte:dc.end_byte].decode("utf-8")
+    return None
+
+
+def _index_cpp_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+    """Index functions and methods from a C++ file.
+
+    Handles UE5 patterns:
+    - Qualified names: AMyClass::BeginPlay -> indexed as both full and bare name
+    - Method declarations in headers (inside UE5 macro-mangled class bodies)
+    - UCLASS/UFUNCTION macros that confuse tree-sitter
+    """
+    if not TREE_SITTER_CPP_AVAILABLE:
+        return
+
+    try:
+        source = src_path.read_bytes()
+        parser = _get_cpp_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return
+
+    def add_to_index(name: str):
+        """Helper to add a name to the index."""
+        index[(module_name, name)] = str(rel_path)
+        index[(simple_module, name)] = str(rel_path)
+        # For qualified names like AMyClass::BeginPlay, also index bare name
+        if "::" in name:
+            bare = name.rsplit("::", 1)[1]
+            index[(module_name, bare)] = str(rel_path)
+            index[(simple_module, bare)] = str(rel_path)
+
+    def walk_tree(node):
+        # Function definitions (implementations)
+        if node.type == "function_definition":
+            name = _get_cpp_node_name(node, source)
+            if name:
+                add_to_index(name)
+
+        # Function declarations (headers) - declaration with function_declarator
+        elif node.type == "declaration":
+            for child in node.children:
+                if child.type == "function_declarator":
+                    name = _get_cpp_declarator_name(child, source)
+                    if name:
+                        add_to_index(name)
+                    break
+
+        for child in node.children:
+            walk_tree(child)
+
+    walk_tree(tree.root_node)
+
+
+def _get_cpp_node_name(node, source: bytes) -> str | None:
+    """Get the function name from a C++ function_definition node.
+
+    Handles qualified names (Class::Method) unlike the C version.
+    """
+    for child in node.children:
+        if child.type == "function_declarator":
+            return _get_cpp_declarator_name(child, source)
+        elif child.type == "pointer_declarator":
+            for pc in child.children:
+                if pc.type == "function_declarator":
+                    return _get_cpp_declarator_name(pc, source)
+        elif child.type == "reference_declarator":
+            for rc in child.children:
+                if rc.type == "function_declarator":
+                    return _get_cpp_declarator_name(rc, source)
+    return None
+
+
+def _get_cpp_declarator_name(declarator_node, source: bytes) -> str | None:
+    """Extract name from a function_declarator node.
+
+    Handles both plain identifiers and qualified_identifiers (Class::Method).
+    """
+    for dc in declarator_node.children:
+        if dc.type == "identifier":
+            return source[dc.start_byte:dc.end_byte].decode("utf-8")
+        elif dc.type == "qualified_identifier":
+            return source[dc.start_byte:dc.end_byte].decode("utf-8")
+        elif dc.type == "destructor_name":
+            return source[dc.start_byte:dc.end_byte].decode("utf-8")
+    return None
+
+
+def _extract_cpp_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+    """
+    Extract all function calls from a C++ file, grouped by caller function.
+
+    Handles:
+    - Qualified calls (Super::BeginPlay, UClass::StaticMethod)
+    - Member calls (Obj->Method, Obj.Method)
+    - Free function calls
+
+    Returns:
+        Dict mapping caller function name to list of (call_type, call_target) tuples
+        call_type is 'direct' or 'intra'
+    """
+    if not TREE_SITTER_CPP_AVAILABLE:
+        return {}
+
+    try:
+        source = file_path.read_bytes()
+        parser = _get_cpp_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return {}
+
+    calls_by_func = {}
+    defined_names = set()
+
+    # First pass: collect all defined function names
+    def collect_definitions(node):
+        if node.type == "function_definition":
+            name = _get_cpp_node_name(node, source)
+            if name:
+                defined_names.add(name)
+                # Also add bare name for matching
+                if "::" in name:
+                    defined_names.add(name.rsplit("::", 1)[1])
+        elif node.type == "declaration":
+            for child in node.children:
+                if child.type == "function_declarator":
+                    name = _get_cpp_declarator_name(child, source)
+                    if name:
+                        defined_names.add(name)
+                    break
+
+        for child in node.children:
+            collect_definitions(child)
+
+    collect_definitions(tree.root_node)
+
+    # Second pass: extract calls from each function
+    def extract_calls_from_func(func_node, func_name: str):
+        calls = []
+
+        def visit_calls(node):
+            if node.type == "call_expression":
+                callee = _get_cpp_call_callee(node, source)
+                if callee:
+                    # Check bare name for intra-file matching
+                    bare = callee.rsplit("::", 1)[-1] if "::" in callee else callee
+                    if bare in defined_names or callee in defined_names:
+                        calls.append(('intra', callee))
+                    else:
+                        calls.append(('direct', callee))
+
+            for child in node.children:
+                visit_calls(child)
+
+        visit_calls(func_node)
+        return calls
+
+    # Third pass: process functions
+    def process_functions(node):
+        if node.type == "function_definition":
+            name = _get_cpp_node_name(node, source)
+            if name:
+                calls_by_func[name] = extract_calls_from_func(node, name)
+
+        for child in node.children:
+            process_functions(child)
+
+    process_functions(tree.root_node)
+    return calls_by_func
+
+
+def _get_cpp_call_callee(node, source: bytes) -> str | None:
+    """Get the callee name from a C++ call_expression node.
+
+    Handles:
+    - Simple: DoSomething()
+    - Qualified: Super::BeginPlay(), UKismetSystemLibrary::PrintString()
+    - Member: Obj->Method(), Obj.Method()
+    """
+    for child in node.children:
+        if child.type == "identifier":
+            return source[child.start_byte:child.end_byte].decode("utf-8")
+        elif child.type == "qualified_identifier":
+            return source[child.start_byte:child.end_byte].decode("utf-8")
+        elif child.type == "field_expression":
+            # member->Method() or object.Method()
+            for fc in child.children:
+                if fc.type == "field_identifier":
+                    return source[fc.start_byte:fc.end_byte].decode("utf-8")
+        elif child.type == "template_function":
+            # Template call like Cast<AMyActor>(...)
+            for tc in child.children:
+                if tc.type == "identifier":
+                    return source[tc.start_byte:tc.end_byte].decode("utf-8")
     return None
 
 
@@ -3309,6 +3504,8 @@ def build_project_call_graph(
         _build_java_call_graph(root, graph, func_index, workspace_config)
     elif language == "c":
         _build_c_call_graph(root, graph, func_index, workspace_config)
+    elif language == "cpp":
+        _build_cpp_call_graph(root, graph, func_index, workspace_config)
     elif language == "php":
         _build_php_call_graph(root, graph, func_index, workspace_config)
 
@@ -3819,6 +4016,55 @@ def _build_c_call_graph(
                             if name == call_target:
                                 graph.add_edge(rel_path, caller_func, file_path, call_target)
                                 break
+
+
+def _build_cpp_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    func_index: dict,
+    workspace_config: Optional[WorkspaceConfig] = None
+):
+    """Build call graph for C++ files.
+
+    Handles UE5 patterns:
+    - Qualified method names (AMyClass::BeginPlay)
+    - Member calls (Component->DoThing)
+    - Cross-file resolution via #include and function index
+    """
+    for cpp_file in scan_project(root, "cpp", workspace_config):
+        cpp_path = Path(cpp_file)
+        rel_path = str(cpp_path.relative_to(root))
+
+        # Get calls from this file
+        calls_by_func = _extract_cpp_file_calls(cpp_path, root)
+
+        for caller_func, calls in calls_by_func.items():
+            for call_type, call_target in calls:
+                if call_type == 'intra':
+                    # Intra-file call
+                    graph.add_edge(rel_path, caller_func, rel_path, call_target)
+
+                elif call_type == 'direct':
+                    # Cross-file call - try to find in function index
+                    # First try exact match (qualified name)
+                    found = False
+                    for key, file_path in func_index.items():
+                        if isinstance(key, tuple) and len(key) == 2:
+                            mod, name = key
+                            if name == call_target:
+                                graph.add_edge(rel_path, caller_func, file_path, call_target)
+                                found = True
+                                break
+
+                    # Also try bare name match for qualified calls
+                    if not found and "::" in call_target:
+                        bare = call_target.rsplit("::", 1)[1]
+                        for key, file_path in func_index.items():
+                            if isinstance(key, tuple) and len(key) == 2:
+                                mod, name = key
+                                if name == bare:
+                                    graph.add_edge(rel_path, caller_func, file_path, bare)
+                                    break
 
 
 def _build_php_call_graph(

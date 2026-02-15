@@ -106,7 +106,7 @@ def _detect_language(file_path: str) -> str:
         ".rs": "rust",
         ".java": "java",
         ".c": "c",
-        ".h": "c",
+        ".h": "cpp",
         ".cpp": "cpp",
         ".cc": "cpp",
         ".cxx": "cpp",
