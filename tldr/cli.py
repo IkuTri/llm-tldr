@@ -287,6 +287,18 @@ Semantic Search:
         "--entry", nargs="*", default=[], help="Additional entry point patterns"
     )
     dead_p.add_argument("--lang", default="auto", help="Language (auto=cached, all=detect)")
+    dead_p.add_argument(
+        "--ue5", action="store_true", default=None,
+        help="Filter UE5 false positives (UFUNCTION, lifecycle, ctors). Default: ON for --lang cpp"
+    )
+    dead_p.add_argument(
+        "--no-ue5", action="store_true", default=False,
+        help="Disable UE5 filtering even for C++ code"
+    )
+    dead_p.add_argument(
+        "--show-filtered", action="store_true", default=False,
+        help="Show what UE5 functions were filtered and why"
+    )
 
     # tldr arch [path]
     arch_p = subparsers.add_parser(
@@ -781,6 +793,62 @@ Semantic Search:
                 all_functions,
                 entry_points=args.entry if args.entry else None,
             )
+
+            # UE5 filtering: default ON for C++, can be forced with --ue5 / --no-ue5
+            use_ue5 = args.ue5
+            if use_ue5 is None:
+                # Auto-detect: enable for C++ language
+                use_ue5 = lang in ("cpp", "c")
+            if args.no_ue5:
+                use_ue5 = False
+
+            if use_ue5 and result.get("dead_functions"):
+                from .ue5_filter import filter_dead_functions
+
+                project_path = Path(args.path).resolve()
+                filtered_dead, filter_result = filter_dead_functions(
+                    result["dead_functions"],
+                    project_path,
+                    show_filtered=args.show_filtered,
+                )
+
+                # Rebuild result with filtered data
+                from collections import defaultdict
+                by_file = defaultdict(list)
+                for func in filtered_dead:
+                    by_file[func["file"]].append(func["function"])
+
+                result["dead_functions"] = filtered_dead
+                result["by_file"] = dict(by_file)
+                result["total_dead"] = len(filtered_dead)
+                result["dead_percentage"] = round(
+                    len(filtered_dead) / max(result["total_functions"], 1) * 100, 1
+                )
+
+                # Add UE5 filter metadata
+                result["ue5_filter"] = {
+                    "enabled": True,
+                    "ufunction_count": len(filter_result.ufunction_filtered),
+                    "lifecycle_count": len(filter_result.lifecycle_filtered),
+                    "constructor_count": len(filter_result.constructor_filtered),
+                    "onrep_count": len(filter_result.onrep_filtered),
+                    "total_filtered": (
+                        len(filter_result.ufunction_filtered)
+                        + len(filter_result.lifecycle_filtered)
+                        + len(filter_result.constructor_filtered)
+                        + len(filter_result.onrep_filtered)
+                    ),
+                    "summary": filter_result.summary(),
+                }
+
+                if args.show_filtered:
+                    result["ue5_filter"]["filtered_details"] = {
+                        "ufunction": filter_result.ufunction_filtered,
+                        "lifecycle": filter_result.lifecycle_filtered,
+                        "constructor": filter_result.constructor_filtered,
+                        "onrep": filter_result.onrep_filtered,
+                    }
+
             print(json.dumps(result, indent=2))
 
         elif args.command == "arch":
