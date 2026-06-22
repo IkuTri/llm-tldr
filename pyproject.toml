@@ -50,7 +50,6 @@ dependencies = [
     "tree-sitter-lua<=0.4.1",
     "tree-sitter-luau",
     "tree-sitter-elixir>=0.3.0",
-    "sentence-transformers>=5.2.0",
     "faiss-cpu>=1.13.2",
     "anthropic>=0.75.0",
     "tiktoken>=0.12.0",
@@ -58,6 +57,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Heavy ML stack (sentence-transformers pulls torch + CUDA, ~4.5GB) — only needed
+# for `tldr semantic`. Install with: uv sync --extra semantic
+semantic = [
+    "sentence-transformers>=5.2.0",
+]
 ai = [
     "anthropic>=0.3.0",
     "openai>=1.0.0",
