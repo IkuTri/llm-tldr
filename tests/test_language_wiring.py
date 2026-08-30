@@ -23,8 +23,8 @@ SUPPORTED_LANGUAGES = {
     "go": [".go"],
     "rust": [".rs"],
     "java": [".java"],
-    "c": [".c", ".h"],
-    "cpp": [".cpp", ".cc", ".hpp"],  # .cxx/.hh/.hxx not in cli.py yet
+    "c": [".c"],
+    "cpp": [".cpp", ".cc", ".hpp", ".h"],  # UE headers use the C++ parser
     "ruby": [".rb"],
     "php": [".php"],
     "kotlin": [".kt", ".kts"],
