@@ -1,6 +1,6 @@
 # Core dependencies
 pygments-tldr>=2.19.3.0
-requests>=2.25.0
+requests>=2.33.0
 toml>=0.10.2
 
 # Optional AI providers (install with: pip install tldr-code[ai])
